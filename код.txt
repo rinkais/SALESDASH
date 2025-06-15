@@ -1,0 +1,1218 @@
+import logging
+import hashlib
+import random
+import zoneinfo
+import requests
+from datetime import datetime, date, timedelta, time
+from telegram import Update, ReplyKeyboardRemove, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
+
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+ENTER_IIKO_SERVER_ADDRESS = 1
+ENTER_IIKO_LOGIN = 2
+ENTER_IIKO_PASSWORD = 3
+MAIN_MENU = 4
+REPORT_MENU = 5
+
+LOADING_MESSAGES = [
+    "Секунду, формирую ваш отчет... Это может занять немного времени. ⏳",
+    "Идет обработка данных... 📊 Подождите немного, скоро всё будет готово!",
+    "Загружаю отчет... ⏳",
+    "Сейчас подготовлю ваш отчет, пожалуйста, подождите немного! 🚀",
+    "Идет обработка данных... 📊 Подождите немного, скоро всё будет готово!"
+]
+
+IIKO_TIMEZONE = zoneinfo.ZoneInfo("Asia/Yekaterinburg")
+SHIFT_HOUR = 6  # начало дня в 06:00
+SHIFT_MINUTE = 0
+
+def get_period_dates(period_name: str) -> tuple[datetime, datetime]:
+    now = datetime.now(IIKO_TIMEZONE)
+    today = now.date()
+
+    if "Сегодня" in period_name:
+        day = today
+        start = datetime.combine(day, time(hour=SHIFT_HOUR, minute=SHIFT_MINUTE), tzinfo=IIKO_TIMEZONE)
+        end = datetime.combine(day, time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+    elif "Вчера" in period_name:
+        day = today - timedelta(days=1)
+        start = datetime.combine(day, time(hour=SHIFT_HOUR, minute=SHIFT_MINUTE), tzinfo=IIKO_TIMEZONE)
+        end = datetime.combine(day, time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+    elif "Неделя" in period_name:
+        start_day = today - timedelta(days=6)
+        start = datetime.combine(start_day, time(hour=SHIFT_HOUR, minute=SHIFT_MINUTE), tzinfo=IIKO_TIMEZONE)
+        end = datetime.combine(today, time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+    elif "Текущий месяц" in period_name:
+        first_day = today.replace(day=1)
+        start = datetime.combine(first_day, time(hour=SHIFT_HOUR, minute=SHIFT_MINUTE), tzinfo=IIKO_TIMEZONE)
+        end = datetime.combine(today, time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+    elif "Прошлый месяц" in period_name:
+        first_day_this_month = today.replace(day=1)
+        last_day_last_month = first_day_this_month - timedelta(days=1)
+        first_day_last_month = last_day_last_month.replace(day=1)
+        start = datetime.combine(first_day_last_month, time(hour=SHIFT_HOUR, minute=SHIFT_MINUTE), tzinfo=IIKO_TIMEZONE)
+        end = datetime.combine(last_day_last_month, time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+    else:
+        day = today
+        start = datetime.combine(day, time(hour=SHIFT_HOUR, minute=SHIFT_MINUTE), tzinfo=IIKO_TIMEZONE)
+        end = datetime.combine(day, time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+
+    return start, end
+
+from datetime import timedelta
+
+async def get_average_check(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> dict | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": [],
+        "aggregateFields": ["DishDiscountSumInt", "UniqOrderId"],
+        "filters": {
+            "OpenDate.Typed": {
+                "filterType": "DateRange",
+                "periodType": "CUSTOM",
+                "from": start_date.strftime("%Y-%m-%dT00:00:00.000"),
+                "to": (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+            },
+            "DeletedWithWriteoff": {
+                "filterType": "ExcludeValues",
+                "values": ["DELETED_WITH_WRITEOFF", "DELETED_WITHOUT_WRITEOFF"]
+            },
+            "OrderDeleted": {
+                "filterType": "IncludeValues",
+                "values": ["NOT_DELETED"]
+            }
+        }
+    }
+    try:
+        import requests
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data and data.get('data') and isinstance(data['data'], list) and len(data['data']) > 0:
+            row = data['data'][0]
+            total_sum = row.get('DishDiscountSumInt', 0)
+            order_count = row.get('UniqOrderId', 0)
+            avg_check = total_sum / order_count if order_count else 0
+            return {
+                "total_sum": total_sum,
+                "order_count": order_count,
+                "avg_check": avg_check
+            }
+        return None
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Ошибка при получении отчета 'Средний чек': {e}, ответ: {getattr(response, 'text', '')}")
+        return None
+
+async def get_order_cancellations_and_deleted_dishes(
+    iiko_server_url: str, iiko_session_token: str,
+    start_date, end_date
+) -> list | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": [
+            "Department",
+            "OpenDate.Typed",
+            "OrderDeleted",
+            "DeletedWithWriteoff",
+            "OrderNum",
+            "OrderType",
+            "OpenTime",
+            "AuthUser",
+            "Delivery.CancelCause",
+            "RemovalType",
+            "Delivery.CancelComment",
+            "DeletionComment"
+        ],
+        "aggregateFields": [
+            "DishReturnSum",
+            "DishSumInt"
+        ],
+        "filters": {
+            "OpenDate.Typed": {
+                "filterType": "DateRange",
+                "periodType": "CUSTOM",
+                "from": start_date.strftime("%Y-%m-%dT00:00:00.000"),
+                "to": (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+            },
+            "DeletedWithWriteoff": {
+                "filterType": "IncludeValues",
+                "values": [
+                    "DELETED_WITH_WRITEOFF",
+                    "DELETED_WITHOUT_WRITEOFF",
+                    None
+                ]
+            },
+            "RemovalType": {
+                "filterType": "IncludeValues",
+                "values": [
+                    "Со списанием",
+                    "Без списания"
+                ]
+            }
+        }
+    }
+    try:
+        import requests
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data and data.get("data") and isinstance(data["data"], list) and len(data["data"]) > 0:
+            return data["data"]
+        return None
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Ошибка при получении отчета 'Отмены и удаления': {e}, ответ: {getattr(response, 'text', '')}")
+        return None
+
+async def get_store_balances(iiko_server_url: str, iiko_session_token: str) -> list | None:
+    now = datetime.now(IIKO_TIMEZONE)
+    end_of_day = datetime.combine(now.date(), time(hour=23, minute=59, second=59), tzinfo=IIKO_TIMEZONE)
+    timestamp = end_of_day.strftime("%Y-%m-%dT%H:%M:%S")
+
+    url = f"{iiko_server_url}api/v2/reports/balance/stores"
+    params = {
+        "key": iiko_session_token,
+        "timestamp": timestamp
+    }
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        return data
+    except Exception as e:
+        logger.error(f"Ошибка при получении остатка по складам: {e}")
+        return None
+
+
+
+def sha1_hash(text: str) -> str:
+    return hashlib.sha1(text.encode('utf-8')).hexdigest()
+
+async def authenticate_iiko_server(server_url: str, login: str, password_hash: str) -> str | None:
+    auth_url = f"{server_url}api/auth?login={login}&pass={password_hash}"
+    logger.info(f"Attempting to authenticate to iikoServer API at {auth_url} with login: {login}...")
+    try:
+        response = requests.get(auth_url, timeout=10)
+        response.raise_for_status()
+        token = response.text.strip()
+        if token:
+            logger.info(f"Successfully received iikoServer token.")
+            return token
+        else:
+            logger.warning(f"iikoServer API response did not contain a token. Response: {response.text}")
+            return None
+    except Exception as e:
+        logger.error(f"Error during iikoServer authentication: {str(e)}")
+        return None
+
+async def get_pay_types_revenue_from_iiko_server(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> dict | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    start_date_str = start_date.strftime("%Y-%m-%dT00:00:00.000")
+    end_date_str = (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": [
+            "OpenDate.Typed",
+            "PayTypes"
+        ],
+        "aggregateFields": [
+            "DishSumInt",
+            "DishDiscountSumInt",
+            "UniqOrderId"
+        ],
+        "filters": {
+            "OpenDate.Typed": {
+                "filterType": "DateRange",
+                "periodType": "CUSTOM",
+                "from": start_date_str,
+                "to": end_date_str
+            },
+            "DeletedWithWriteoff": {
+                "filterType": "ExcludeValues",
+                "values": ["DELETED_WITH_WRITEOFF", "DELETED_WITHOUT_WRITEOFF"]
+            },
+            "OrderDeleted": {
+                "filterType": "IncludeValues",
+                "values": ["NOT_DELETED"]
+            }
+        }
+    }
+    logger.info(f"Attempting to get 'Revenue by Payment Types' report from iikoServer API v2 at {report_url} (from {start_date_str} to {end_date_str})...")
+    try:
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        total_revenue_overall = 0.0
+        total_order_count_overall = 0
+        sales_by_payment_type = {}
+        if data and data.get('data') and isinstance(data['data'], list):
+            for row in data['data']:
+                payment_type = row.get('PayTypes', 'Неизвестный тип оплаты')
+                sales_sum = row.get('DishDiscountSumInt', 0.0)
+                order_count = row.get('UniqOrderId', 0)
+                total_revenue_overall += sales_sum
+                total_order_count_overall += order_count
+                if payment_type:
+                    sales_by_payment_type[payment_type] = sales_by_payment_type.get(payment_type, 0.0) + sales_sum
+                else:
+                    sales_by_payment_type['Другие/Неопределенные'] = sales_by_payment_type.get('Другие/Неопределенные', 0.0) + sales_sum
+            logger.info(f"Successfully received and processed 'Revenue by Payment Types' report from iikoServer API v2 for period {start_date} to {end_date}.")
+            if total_revenue_overall == 0 and total_order_count_overall == 0:
+                logger.info("No revenue data found for the specified date range in the iikoServer report after filtering.")
+                return None
+            return {
+                'total_revenue_overall': total_revenue_overall,
+                'total_order_count_overall': total_order_count_overall,
+                'sales_by_payment_type': sales_by_payment_type,
+            }
+        else:
+            logger.warning(f"iikoServer API response for 'Revenue by Payment Types' report v2 did not contain expected 'data' list: {data}")
+            return None
+    except Exception as e:
+        logger.error(f"Exception in get_pay_types_revenue_from_iiko_server: {e}")
+        return None
+
+async def get_discounts_and_markups_report(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> list | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": ["OrderDiscount.Type", "OrderIncrease.Type"],
+        "aggregateFields": ["DiscountSum", "IncreaseSum", "OrderNum"],
+        "filters": {
+            "OpenDate.Typed": {
+                "filterType": "DateRange",
+                "periodType": "CUSTOM",
+                "from": start_date.strftime("%Y-%m-%dT00:00:00.000"),
+                "to": (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+            },
+            "DeletedWithWriteoff": {
+                "filterType": "ExcludeValues",
+                "values": ["DELETED_WITH_WRITEOFF", "DELETED_WITHOUT_WRITEOFF"]
+            },
+            "OrderDeleted": {
+                "filterType": "IncludeValues",
+                "values": ["NOT_DELETED"]
+            }
+        }
+    }
+    try:
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        results = []
+        if data and data.get('data') and isinstance(data['data'], list):
+            for row in data['data']:
+                discount = row.get('OrderDiscount.Type')
+                increase = row.get('OrderIncrease.Type')
+                discount_sum = row.get('DiscountSum', 0.0)
+                increase_sum = row.get('IncreaseSum', 0.0)
+                order_count = row.get('OrderNum', 0)
+                if discount:
+                    results.append({
+                        "type": "Скидка",
+                        "name": discount,
+                        "sum": discount_sum,
+                        "orders": order_count
+                    })
+                if increase:
+                    results.append({
+                        "type": "Надбавка",
+                        "name": increase,
+                        "sum": increase_sum,
+                        "orders": order_count
+                    })
+            return results
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при получении отчета 'Скидки и надбавки': {e}, ответ: {getattr(response, 'text', '')}")
+        return None
+
+
+
+async def get_dish_category_revenue_from_iiko_server(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> dict | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    start_date_str = start_date.strftime("%Y-%m-%dT00:00:00.000")
+    end_date_str = (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": ["DishCategory"],
+        "aggregateFields": ["DishSumInt", "DishDiscountSumInt", "UniqOrderId"],
+        "filters": {
+            "OpenDate.Typed": {"filterType": "DateRange", "periodType": "CUSTOM", "from": start_date_str, "to": end_date_str},
+            "DeletedWithWriteoff": {"filterType": "IncludeValues", "values": ["NOT_DELETED"]},
+            "OrderDeleted": {"filterType": "IncludeValues", "values": ["NOT_DELETED"]}
+        }
+    }
+    logger.info(f"Attempting to get 'Revenue by Dish Category' report from iikoServer API v2 at {report_url} (from {start_date_str} to {end_date_str})...")
+    try:
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        total_revenue_overall = 0.0
+        total_order_count_overall = 0
+        sales_by_category = {}
+        if data and data.get('data') and isinstance(data['data'], list):
+            for row in data['data']:
+                dish_category = row.get('DishCategory', 'Неизвестная категория')
+                sales_sum = row.get('DishDiscountSumInt', 0.0)
+                order_count = row.get('UniqOrderId', 0)
+                total_revenue_overall += sales_sum
+                total_order_count_overall += order_count
+                if dish_category:
+                    sales_by_category[dish_category] = sales_by_category.get(dish_category, 0.0) + sales_sum
+                else:
+                    sales_by_category['Другие/Неопределенные'] = sales_by_category.get('Другие/Неопределенные', 0.0) + sales_sum
+            logger.info(f"Successfully received and processed 'Revenue by Dish Category' report from iikoServer API v2 for period {start_date} to {end_date}.")
+            if total_revenue_overall == 0 and total_order_count_overall == 0:
+                logger.info("No revenue data found for the specified date range in the iikoServer report after filtering by dish category.")
+                return None
+            return {
+                'total_revenue_overall': total_revenue_overall,
+                'total_order_count_overall': total_order_count_overall,
+                'sales_by_category': sales_by_category,
+            }
+        else:
+            logger.warning(f"iikoServer API response for 'Revenue by Dish Category' report v2 did not contain expected 'data' list: {data}")
+            return None
+    except Exception as e:
+        logger.error(f"Exception in get_dish_category_revenue_from_iiko_server: {e}")
+        return None
+
+
+
+
+
+
+
+async def get_waiter_revenue_from_iiko_server(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> dict | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    start_date_str = start_date.strftime("%Y-%m-%dT00:00:00.000")
+    end_date_str = (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": ["WaiterName"],
+        "aggregateFields": ["DishSumInt", "DishDiscountSumInt"],
+        "filters": {
+            "OpenDate.Typed": {"filterType": "DateRange", "periodType": "CUSTOM", "from": start_date_str, "to": end_date_str},
+            "DeletedWithWriteoff": {"filterType": "IncludeValues", "values": ["NOT_DELETED"]},
+            "OrderDeleted": {"filterType": "IncludeValues", "values": ["NOT_DELETED"]}
+        }
+    }
+    logger.info(f"Attempting to get 'Revenue by Waiter' report from iikoServer API v2 at {report_url} (from {start_date_str} to {end_date_str})...")
+    try:
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        total_revenue_overall = 0.0
+        sales_by_waiter = {}
+        if data and data.get('data') and isinstance(data['data'], list):
+            for row in data['data']:
+                waiter_name = row.get('WaiterName', 'Неизвестный официант')
+                sales_sum = row.get('DishDiscountSumInt', 0.0)
+                total_revenue_overall += sales_sum
+                if waiter_name:
+                    sales_by_waiter[waiter_name] = sales_by_waiter.get(waiter_name, 0.0) + sales_sum
+                else:
+                    sales_by_waiter['Другие/Неопределенные'] = sales_by_waiter.get('Другие/Неопределенные', 0.0) + sales_sum
+            logger.info(f"Successfully received and processed 'Revenue by Waiter' report from iikoServer API v2 for period {start_date} to {end_date}.")
+            if total_revenue_overall == 0:
+                logger.info("No revenue data found for the specified date range in the iikoServer report after filtering by waiter.")
+                return None
+            return {'total_revenue_overall': total_revenue_overall, 'sales_by_waiter': sales_by_waiter}
+        else:
+            logger.warning(f"iikoServer API response for 'Revenue by Waiter' report v2 did not contain expected 'data' list: {data}")
+            return None
+    except Exception as e:
+        logger.error(f"Exception in get_waiter_revenue_from_iiko_server: {e}")
+        return None
+
+async def get_order_type_revenue_from_iiko_server(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> dict | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    start_date_str = start_date.strftime("%Y-%m-%dT00:00:00.000")
+    end_date_str = (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": ["OrderType"],
+        "aggregateFields": ["DishSumInt", "DishDiscountSumInt", "UniqOrderId"],
+        "filters": {
+            "OpenDate.Typed": {"filterType": "DateRange", "periodType": "CUSTOM", "from": start_date_str, "to": end_date_str},
+            "DeletedWithWriteoff": {"filterType": "IncludeValues", "values": ["NOT_DELETED"]},
+            "OrderDeleted": {"filterType": "IncludeValues", "values": ["NOT_DELETED"]}
+        }
+    }
+    logger.info(f"Attempting to get 'Revenue by Order Type' report from iikoServer API v2 at {report_url} (from {start_date_str} to {end_date_str})...")
+    try:
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        total_revenue_overall = 0.0
+        total_order_count_overall = 0
+        sales_by_order_type = {}
+        order_count_by_type = {}
+        if data and data.get('data') and isinstance(data['data'], list):
+            for row in data['data']:
+                order_type = row.get('OrderType')
+                sales_sum = row.get('DishDiscountSumInt', 0.0)
+                order_count = row.get('UniqOrderId', 0)
+                total_revenue_overall += sales_sum
+                total_order_count_overall += order_count
+                if not order_type:
+                    order_type_display = "Заказы в заведении"
+                else:
+                    order_type_display = order_type
+                sales_by_order_type[order_type_display] = sales_by_order_type.get(order_type_display, 0.0) + sales_sum
+                order_count_by_type[order_type_display] = order_count_by_type.get(order_type_display, 0) + order_count
+            logger.info(f"Successfully received and processed 'Revenue by Order Type' report from iikoServer API v2 for period {start_date} to {end_date}.")
+            if total_revenue_overall == 0 and total_order_count_overall == 0:
+                logger.info("No revenue data found for the specified date range in the iikoServer report after filtering by order type.")
+                return None
+            return {
+                'total_revenue_overall': total_revenue_overall,
+                'total_order_count_overall': total_order_count_overall,
+                'sales_by_order_type': sales_by_order_type,
+                'order_count_by_type': order_count_by_type,
+            }
+        else:
+            logger.warning(f"iikoServer API response for 'Revenue by Order Type' report v2 did not contain expected 'data' list: {data}")
+            return None
+    except Exception as e:
+        logger.error(f"Exception in get_order_type_revenue_from_iiko_server: {e}")
+        return None
+
+async def get_summary_revenue_report_data(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date) -> dict:
+    summary_data = {
+        'start_date': start_date.strftime('%d.%m.%Y'),
+        'end_date': end_date.strftime('%d.%m.%Y'),
+        'pay_types_revenue': None,
+        'dish_category_revenue': None,
+        'waiter_revenue': None,
+        'order_type_revenue': None,
+    }
+    pay_types_data = await get_pay_types_revenue_from_iiko_server(iiko_server_url, iiko_session_token, start_date, end_date)
+    if pay_types_data:
+        summary_data['pay_types_revenue'] = pay_types_data
+    dish_category_data = await get_dish_category_revenue_from_iiko_server(iiko_server_url, iiko_session_token, start_date, end_date)
+    if dish_category_data:
+        summary_data['dish_category_revenue'] = dish_category_data
+    waiter_data = await get_waiter_revenue_from_iiko_server(iiko_server_url, iiko_session_token, start_date, end_date)
+    if waiter_data:
+        summary_data['waiter_revenue'] = waiter_data
+    order_type_data = await get_order_type_revenue_from_iiko_server(iiko_server_url, iiko_session_token, start_date, end_date)
+    if order_type_data:
+        summary_data['order_type_revenue'] = order_type_data
+    return summary_data
+
+async def show_pay_types_revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE, start_date: date, end_date: date) -> None:
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API, используя команду `/start`.")
+        return
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    revenue_data = await get_pay_types_revenue_from_iiko_server(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if revenue_data:
+        response_text = (
+            f"📊 *Отчет: Выручка по типам оплат за {escape_markdown(period_str, version=2)}*\n\n"
+            f"🧾 Общее количество заказов: *{escape_markdown(str(revenue_data['total_order_count_overall']), version=2)}* шт\\.\n"
+            f"💰 Общая выручка: *{escape_markdown(f'{revenue_data['total_revenue_overall']:.2f}', version=2)}* тг\\.\n\n"
+            f"_{escape_markdown('Детализация по типам оплат:', version=2)}_\n"
+        )
+        sorted_payment_types = sorted(revenue_data['sales_by_payment_type'].items(), key=lambda item: item[0])
+        for payment_type, amount in sorted_payment_types:
+            escaped_payment_type = escape_markdown(payment_type, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            response_text += f"▪️ {escaped_payment_type}: *{escaped_amount}* тг\\.\n"
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить отчет 'Выручка по типам оплат' за период *{escape_markdown(period_str, version=2)}* с сервера *{escape_markdown(iiko_server_address, version=2)}*\\.\n"
+            "Возможно, нет данных за указанный период, или произошла ошибка в API iikoServer\\. Проверьте логи бота\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+async def show_order_cancellations_report(update, context, start_date, end_date):
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API командой /start.")
+        return
+
+    LOADING_MESSAGES = [
+        "Секунду, формирую ваш отчет... Это может занять немного времени. ⏳",
+        "Идет обработка данных... 📊 Подождите немного, скоро всё будет готово!",
+        "Загружаю отчет... ⏳",
+        "Сейчас подготовлю ваш отчет, пожалуйста, подождите немного! 🚀",
+        "Идет обработка данных... 📊 Подождите немного, скоро всё будет готово!"
+    ]
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+
+    data = await get_order_cancellations_and_deleted_dishes(
+        iiko_server_address, iiko_session_token, start_date, end_date
+    )
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if data:
+        header = f"📋 *Отчет по отменам/удалениям за {escape_markdown(period_str, version=2)}*\n"
+        lines = [header]
+        for idx, row in enumerate(data, 1):
+            dept = escape_markdown(str(row.get("Department", "")), version=2)
+            date = escape_markdown(str(row.get("OpenDate.Typed", "")), version=2)
+            order_num = escape_markdown(str(row.get("OrderNum", "")), version=2)
+            deleted_status = escape_markdown(str(row.get("DeletedWithWriteoff", "")), version=2)
+            removal_type = escape_markdown(str(row.get("RemovalType", "")), version=2)
+            dish_sum = escape_markdown(str(row.get("DishSumInt", 0)), version=2)
+            return_sum = escape_markdown(str(row.get("DishReturnSum", 0)), version=2)
+            comment = escape_markdown(str(row.get("DeletionComment", "")), version=2)
+            cause = escape_markdown(str(row.get("Delivery.CancelCause", "")), version=2)
+            order_type = escape_markdown(str(row.get("OrderType", "")), version=2)
+            auth_user = escape_markdown(str(row.get("AuthUser", "")), version=2)
+
+            lines.append(
+                f"{idx}\\.\ {dept}, {date}, чек: {order_num}, {order_type}, {deleted_status}, {removal_type}, сумма: {dish_sum}, возврат: {return_sum}, причина: {cause}, коммент: {comment}, автор: {auth_user}"
+            )
+        response = "\n".join(lines)
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Нет данных по отменам/удалениям за период *{escape_markdown(period_str, version=2)}*.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+async def show_average_check_report(update, context, start_date, end_date):
+    from telegram.constants import ParseMode
+    from telegram.helpers import escape_markdown
+    import random
+
+    LOADING_MESSAGES = [
+        "Секунду, формирую ваш отчет... Это может занять немного времени. ⏳",
+        "Идет обработка данных... 📊 Подождите немного, скоро всё будет готово!",
+        "Загружаю отчет... ⏳",
+        "Сейчас подготовлю ваш отчет, пожалуйста, подождите немного! 🚀",
+        "Идет обработка данных... 📊 Подождите немного, скоро всё будет готово!"
+    ]
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API командой /start.")
+        return
+
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    result = await get_average_check(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if result:
+        response_text = (
+            f"📊 *Средний чек за {escape_markdown(period_str, version=2)}*\n\n"
+            f"🧾 Количество заказов: *{escape_markdown(str(result['order_count']), version=2)}* шт\\.\n"
+            f"💰 Общая сумма: *{escape_markdown(f'{result['total_sum']:.2f}', version=2)}* тг\\.\n"
+            f"📈 Средний чек: *{escape_markdown(f'{result['avg_check']:.2f}', version=2)}* тг\\.\n"
+        )
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить отчет 'Средний чек' за период *{escape_markdown(period_str, version=2)}*.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+async def show_discounts_report(update, context, start_date, end_date):
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API командой /start.")
+        return
+
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    discounts = await get_discounts_and_markups_report(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if discounts is not None and len(discounts) > 0:
+        response_text = (
+            f"📊 *Отчет по скидкам и надбавкам за {escape_markdown(period_str, version=2)}*\n"
+        )
+        for d in discounts:
+            escaped_name = escape_markdown(str(d['name']), version=2)
+            escaped_sum = escape_markdown(f"{d['sum']:.2f}", version=2)
+            escaped_orders = escape_markdown(str(d['orders']), version=2)
+            escaped_type = escape_markdown(d['type'], version=2)
+            response_text += f"▪️ {escaped_type} `{escaped_name}`: *{escaped_sum}* тг, чеков: *{escaped_orders}* шт\\.\n"
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить отчет по скидкам и надбавкам за период *{escape_markdown(period_str, version=2)}*.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+async def show_dish_category_revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE, start_date: date, end_date: date) -> None:
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API, используя команду `/start`.")
+        return
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    revenue_data = await get_dish_category_revenue_from_iiko_server(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if revenue_data:
+        response_text = (
+            f"📊 *Отчет: Выручка по категориям блюд за {escape_markdown(period_str, version=2)}*\n\n"
+            f"🧾 Общее количество заказов: *{escape_markdown(str(revenue_data['total_order_count_overall']), version=2)}* шт\\.\n"
+            f"💰 Общая выручка: *{escape_markdown(f'{revenue_data['total_revenue_overall']:.2f}', version=2)}* тг\\.\n\n"
+            f"_{escape_markdown('Детализация по категориям блюд:', version=2)}_\n"
+        )
+        sorted_categories = sorted(revenue_data['sales_by_category'].items(), key=lambda item: item[0])
+        for category, amount in sorted_categories:
+            escaped_category = escape_markdown(category, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            response_text += f"▪️ {escaped_category}: *{escaped_amount}* тг\\.\n"
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить отчет 'Выручка по категориям блюд' за период *{escape_markdown(period_str, version=2)}* с сервера *{escape_markdown(iiko_server_address, version=2)}*\\.\n"
+            "Возможно, нет данных за указанный период, или произошла ошибка в API iikoServer\\. Проверьте логи бота\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+async def show_waiter_revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE, start_date: date, end_date: date) -> None:
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API, используя команду `/start`.")
+        return
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    revenue_data = await get_waiter_revenue_from_iiko_server(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if revenue_data:
+        response_text = (
+            f"📊 *Отчет: Выручка по официантам за {escape_markdown(period_str, version=2)}*\n\n"
+            f"💰 Общая выручка: *{escape_markdown(f'{revenue_data['total_revenue_overall']:.2f}', version=2)}* тг\\.\n\n"
+            f"_{escape_markdown('Детализация по официантам:', version=2)}_\n"
+        )
+        sorted_waiters = sorted(revenue_data['sales_by_waiter'].items(), key=lambda item: item[0])
+        for waiter_name, amount in sorted_waiters:
+            escaped_waiter_name = escape_markdown(waiter_name, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            response_text += f"▪️ {escaped_waiter_name}: *{escaped_amount}* тг\\.\n"
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить отчет 'Выручка по официантам' за период *{escape_markdown(period_str, version=2)}* с сервера *{escape_markdown(iiko_server_address, version=2)}*\\.\n"
+            "Возможно, нет данных за указанный период, или произошла ошибка в API iikoServer\\. Проверьте логи бота\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+async def show_order_type_revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE, start_date: date, end_date: date) -> None:
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API, используя команду `/start`.")
+        return
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    revenue_data = await get_order_type_revenue_from_iiko_server(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if revenue_data:
+        response_text = (
+            f"📊 *Отчет: Выручка по типам заказов за {escape_markdown(period_str, version=2)}*\n\n"
+            f"🧾 Общее количество заказов: *{escape_markdown(str(revenue_data['total_order_count_overall']), version=2)}* шт\\.\n"
+            f"💰 Общая выручка: *{escape_markdown(f'{revenue_data['total_revenue_overall']:.2f}', version=2)}* тг\\.\n\n"
+            f"_{escape_markdown('Детализация по типам заказов:', version=2)}_\n"
+        )
+        sorted_order_types = sorted(revenue_data['sales_by_order_type'].items(), key=lambda item: item[0])
+        for order_type, amount in sorted_order_types:
+            count = revenue_data['order_count_by_type'].get(order_type, 0)
+            escaped_order_type = escape_markdown(order_type, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            escaped_count = escape_markdown(str(count), version=2)
+            response_text += f"▪️ {escaped_order_type}: *{escaped_amount}* тг\\. \\({escaped_count} шт\\.\\)\n"
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить отчет 'Выручка по типам заказов' за период *{escape_markdown(period_str, version=2)}* с сервера *{escape_markdown(iiko_server_address, version=2)}*\\.\n"
+            "Возможно, нет данных за указанный период, или произошла ошибка в API iikoServer\\. Проверьте логи бота\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+
+async def show_summary_revenue_report(update: Update, context: ContextTypes.DEFAULT_TYPE, start_date: date, end_date: date) -> None:
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API, используя команду `/start`.")
+        return
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    summary_data = await get_summary_revenue_report_data(iiko_server_address, iiko_session_token, start_date, end_date)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    response_text = f"📊 *Сводный отчет по выручке за {escape_markdown(period_str, version=2)}*\n\n"
+    if summary_data['pay_types_revenue']:
+        response_text += (
+            f"*_Общая статистика:_*\n"
+            f"💰 Общая выручка: *{escape_markdown(f'{summary_data['pay_types_revenue']['total_revenue_overall']:.2f}', version=2)}* тг\\.\n"
+            f"🧾 Общее количество заказов: *{escape_markdown(str(summary_data['pay_types_revenue']['total_order_count_overall']), version=2)}* шт\\.\n\n"
+        )
+    else:
+        response_text += "_Общая статистика: нет данных или ошибка получения_\\.\n\n"
+    if summary_data['pay_types_revenue'] and summary_data['pay_types_revenue']['sales_by_payment_type']:
+        response_text += f"*_Выручка по типам оплат:_*\n"
+        sorted_payment_types = sorted(summary_data['pay_types_revenue']['sales_by_payment_type'].items(), key=lambda item: item[0])
+        for payment_type, amount in sorted_payment_types:
+            escaped_payment_type = escape_markdown(payment_type, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            response_text += f"▪️ {escaped_payment_type}: *{escaped_amount}* тг\\.\n"
+        response_text += "\n"
+    else:
+        response_text += "_Выручка по типам оплат: нет данных или ошибка получения_\\.\n\n"
+    if summary_data['dish_category_revenue'] and summary_data['dish_category_revenue']['sales_by_category']:
+        response_text += f"*_Выручка по категориям блюд:_*\n"
+        sorted_categories = sorted(summary_data['dish_category_revenue']['sales_by_category'].items(), key=lambda item: item[0])
+        for category, amount in sorted_categories:
+            escaped_category = escape_markdown(category, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            response_text += f"▪️ {escaped_category}: *{escaped_amount}* тг\\.\n"
+        response_text += "\n"
+    else:
+        response_text += "_Выручка по категориям блюд: нет данных или ошибка получения_\\.\n\n"
+    if summary_data['waiter_revenue'] and summary_data['waiter_revenue']['sales_by_waiter']:
+        response_text += f"*_Выручка по официантам:_*\n"
+        sorted_waiters = sorted(summary_data['waiter_revenue']['sales_by_waiter'].items(), key=lambda item: item[0])
+        for waiter_name, amount in sorted_waiters:
+            escaped_waiter_name = escape_markdown(waiter_name, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            response_text += f"▪️ {escaped_waiter_name}: *{escaped_amount}* тг\\.\n"
+        response_text += "\n"
+    else:
+        response_text += "_Выручка по официантам: нет данных или ошибка получения_\\.\n\n"
+    if summary_data['order_type_revenue'] and summary_data['order_type_revenue']['sales_by_order_type']:
+        response_text += f"*_Выручка по типам заказов:_*\n"
+        sorted_order_types = sorted(summary_data['order_type_revenue']['sales_by_order_type'].items(), key=lambda item: item[0])
+        for order_type, amount in sorted_order_types:
+            count = summary_data['order_type_revenue']['order_count_by_type'].get(order_type, 0)
+            escaped_order_type = escape_markdown(order_type, version=2)
+            escaped_amount = escape_markdown(f'{amount:.2f}', version=2)
+            escaped_count = escape_markdown(str(count), version=2)
+            response_text += f"▪️ {escaped_order_type}: *{escaped_amount}* тг\\. \\({escaped_count} шт\\.\\)\n"
+        response_text += "\n"
+    else:
+        response_text += "_Выручка по типам заказов: нет данных или ошибка получения_\\.\n\n"
+    await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+
+
+
+
+import xml.etree.ElementTree as ET
+
+async def get_stores_dict(iiko_server_url: str, iiko_session_token: str) -> dict:
+    url = f"{iiko_server_url}api/corporation/stores"
+    params = {
+        "key": iiko_session_token,
+        "revisionFrom": -1
+    }
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        # Парсим XML!
+        stores_dict = {}
+        root = ET.fromstring(response.text)
+        for store in root.findall(".//corporateItemDto"):
+            store_id = store.find("id").text
+            store_name = store.find("name").text
+            stores_dict[store_id] = store_name
+        return stores_dict
+    except Exception as e:
+        logger.error(f"Ошибка при получении справочника складов: {e}, ответ: {getattr(response, 'text', '')}")
+        return {}
+
+async def get_top_dishes_report(iiko_server_url: str, iiko_session_token: str, start_date: date, end_date: date, top_n: int = 10) -> list | None:
+    report_url = f"{iiko_server_url}api/v2/reports/olap"
+    headers = {
+        'Content-Type': 'application/json',
+        'Cookie': f'key={iiko_session_token}'
+    }
+    payload = {
+        "reportType": "SALES",
+        "groupByRowFields": ["DishName"],
+        "aggregateFields": ["DishDiscountSumInt", "DishAmountInt"],
+        "filters": {
+            "OpenDate.Typed": {
+                "filterType": "DateRange",
+                "periodType": "CUSTOM",
+                "from": start_date.strftime("%Y-%m-%dT00:00:00.000"),
+                "to": (end_date + timedelta(days=1)).strftime("%Y-%m-%dT00:00:00.000")
+            },
+            "DeletedWithWriteoff": {
+                "filterType": "IncludeValues",
+                "values": ["NOT_DELETED"]
+            },
+            "OrderDeleted": {
+                "filterType": "IncludeValues",
+                "values": ["NOT_DELETED"]
+            }
+        }
+    }
+    try:
+        response = requests.post(report_url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data and data.get('data') and isinstance(data['data'], list):
+            # сортируем блюда по выручке по убыванию и берем топ-N
+            sorted_dishes = sorted(
+                data['data'],
+                key=lambda x: x.get('DishDiscountSumInt', 0.0),
+                reverse=True
+            )[:top_n]
+            return sorted_dishes
+        return None
+    except Exception as e:
+        logger.error(f"Ошибка при получении топа блюд: {e}, ответ: {getattr(response, 'text', '')}")
+        return None
+
+async def get_products_dict(iiko_server_url: str, iiko_session_token: str) -> dict:
+    url = f"{iiko_server_url}api/v2/entities/products/list"
+    params = {
+        "key": iiko_session_token
+    }
+    headers = {
+        'Content-Type': 'application/json'
+        # НЕ добавляй Cookie!
+    }
+    try:
+        response = requests.post(url, headers=headers, params=params, json={}, timeout=60)
+        response.raise_for_status()
+        products = response.json()
+        return {str(product['id']).strip(): product['name'] for product in products}
+    except Exception as e:
+        logger.error(f"Ошибка при получении справочника товаров: {e}, ответ: {getattr(response, 'text', '')}")
+        return {}
+
+
+
+async def show_store_balances_report(update, context) -> None:
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API командой /start.")
+        return
+
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    balances = await get_store_balances(iiko_server_address, iiko_session_token)
+    now = datetime.now(IIKO_TIMEZONE)
+    date_str = now.strftime('%d.%m.%Y %H:%M')
+
+    stores_dict = await get_stores_dict(iiko_server_address, iiko_session_token)
+    products_dict = await get_products_dict(iiko_server_address, iiko_session_token)
+    logger.info(f"products_dict sample: {list(products_dict.items())[:5]}")
+
+    if balances:
+        store_map = {}
+        for item in balances:
+            store = item['store']
+            product = str(item['product']).strip()
+            amount = item['amount']
+            summ = item['sum']
+            if store not in store_map:
+                store_map[store] = []
+            store_map[store].append((product, amount, summ))
+
+        response = f"*Остатки по складам на {escape_markdown(date_str, version=2)}:*\n\n"
+        for store, products in store_map.items():
+            store_name = stores_dict.get(store, store)
+            response += f"*Склад:* `{escape_markdown(str(store_name), version=2)}`\n"
+            for product, amount, summ in products:
+                logger.info(f"product: {product} -- name: {products_dict.get(product, 'NOT FOUND')}")
+                product_name = products_dict.get(product, product)
+                response += (
+                    f"▫️ `{escape_markdown(str(product_name), version=2)}`: "
+                    f"{escape_markdown(str(amount), version=2)} шт, "
+                    f"{escape_markdown(str(summ), version=2)} тг\n"
+                )
+            response += "\n"
+        await update.message.reply_text(response, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не удалось получить остатки по складам на {escape_markdown(date_str, version=2)}.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+async def show_top_dishes_report(update, context, start_date, end_date, top_n=10):
+    iiko_session_token = context.user_data.get('iiko_session_token')
+    iiko_server_address = context.user_data.get('iiko_server_address')
+    if not iiko_session_token or not iiko_server_address:
+        await update.message.reply_text("Пожалуйста, сначала авторизуйтесь в iikoServer API командой /start.")
+        return
+
+    loading_message = random.choice(LOADING_MESSAGES)
+    await update.message.reply_text(loading_message)
+    top_dishes = await get_top_dishes_report(iiko_server_address, iiko_session_token, start_date, end_date, top_n)
+    period_str = f"{start_date.strftime('%d.%m.%Y')} - {end_date.strftime('%d.%m.%Y')}"
+    if start_date == end_date:
+        period_str = start_date.strftime('%d.%m.%Y')
+    if top_dishes is not None and len(top_dishes) > 0:
+        title = escape_markdown(f"Топ-{top_n} блюд по выручке за {period_str}", version=2)
+        response_lines = [f"🏆 *{title}*"]
+        for idx, dish in enumerate(top_dishes, 1):
+            dish_name = escape_markdown(str(dish.get('DishName', 'Неизвестно')), version=2)
+            revenue = escape_markdown(f"{dish.get('DishDiscountSumInt', 0.0):.2f}", version=2)
+            amount = escape_markdown(str(dish.get('DishAmountInt', 0)), version=2)
+            # Экранируем точку, минус и скобки!
+            response_lines.append(f"{idx}\\.\ {dish_name} \\- {revenue} тг \\({amount} шт\\)")
+        response_text = "\n".join(response_lines)
+
+        await update.message.reply_text(response_text, parse_mode=ParseMode.MARKDOWN_V2)
+    else:
+        await update.message.reply_text(
+            f"Не найдено данных по продажам блюд за период *{escape_markdown(period_str, version=2)}*.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    context.user_data.clear()
+    await update.message.reply_text(
+        f"Привет, {user.full_name}! 👋\n"
+        "Я бот, который поможет тебе получать важную информацию из iiko. "
+        "Введите адрес сервера iiko (например https://servername.iiko.it:443/resto/):",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    context.user_data['state'] = ENTER_IIKO_SERVER_ADDRESS
+    logger.info(f"User {user.id} started bot. State set to ENTER_IIKO_SERVER_ADDRESS.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    user_message = update.message.text
+    user = update.effective_user
+    state = context.user_data.get('state')
+    if state == ENTER_IIKO_SERVER_ADDRESS:
+        iiko_server_address = user_message.strip()
+        if not (iiko_server_address.startswith('http://') or iiko_server_address.startswith('https://')):
+            iiko_server_address = 'https://' + iiko_server_address
+        if not iiko_server_address.endswith('/'):
+            iiko_server_address += '/'
+        if not iiko_server_address.endswith('/resto/'):
+            iiko_server_address += 'resto/'
+        context.user_data['iiko_server_address'] = iiko_server_address
+        await update.message.reply_text("Введите ваш логин iikoOffice:")
+        context.user_data['state'] = ENTER_IIKO_LOGIN
+    elif state == ENTER_IIKO_LOGIN:
+        iiko_login = user_message.strip()
+        context.user_data['iiko_login'] = iiko_login
+        await update.message.reply_text("Введите ваш пароль iikoOffice:")
+        context.user_data['state'] = ENTER_IIKO_PASSWORD
+    elif state == ENTER_IIKO_PASSWORD:
+        iiko_password = user_message.strip()
+        iiko_password_hash = sha1_hash(iiko_password)
+        server_url = context.user_data.get('iiko_server_address')
+        login = context.user_data.get('iiko_login')
+        iiko_session_token = await authenticate_iiko_server(server_url, login, iiko_password_hash)
+        if iiko_session_token:
+            context.user_data['iiko_session_token'] = iiko_session_token
+            await send_main_menu_keyboard(update, context)
+            context.user_data['state'] = MAIN_MENU
+            if 'iiko_login' in context.user_data:
+                del context.user_data['iiko_login']
+        else:
+            await update.message.reply_text(
+                "Не удалось авторизоваться в iikoServer API\\. Проверьте **логин** и **пароль**\\. "
+                "Если адрес сервера также неверен, используйте команду `/start` для повторного ввода всех данных\\.\n"
+                "Пожалуйста, введите ваш логин iikoOffice снова:",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            context.user_data['state'] = ENTER_IIKO_LOGIN
+    elif state == MAIN_MENU:
+        await send_main_menu_keyboard(update, context)
+    elif state == REPORT_MENU:
+        await update.message.reply_text(
+            "Пожалуйста, выберите период для отчета или вернитесь в главное меню\\.",
+            parse_mode=ParseMode.MARKDOWN_V2,
+        )
+        report_type = context.user_data.get('current_report_type')
+        if report_type:
+            await send_period_selection_keyboard(update, context, report_type)
+        else:
+            await send_main_menu_keyboard(update, context)
+            context.user_data['state'] = MAIN_MENU
+    else:
+        await update.message.reply_text("Привет! Чтобы начать, пожалуйста, введи команду `/start`.")
+
+async def send_main_menu_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    keyboard = [
+        [KeyboardButton("Сводный отчет по выручке")],
+        [KeyboardButton("Выручка по типам оплат")],
+        [KeyboardButton("Выручка по категориям блюд")],
+        [KeyboardButton("Выручка по официантам")],
+        [KeyboardButton("Выручка по типам заказов")],
+        [KeyboardButton("Топ блюд по выручке")],
+        [KeyboardButton("Отмены и удаления блюд")],
+        [KeyboardButton("Средний чек")],
+        [KeyboardButton("Скидки и Надбавки")],
+        [KeyboardButton("Остатки по складам")],
+        [KeyboardButton("/start")],
+    ]
+
+    
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=False)
+    await update.message.reply_text(
+        "Выберите отчет:", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2
+    )
+
+async def send_period_selection_keyboard(update: Update, context: ContextTypes.DEFAULT_TYPE, report_name: str) -> None:
+    context.user_data['current_report_type'] = report_name
+    keyboard = [
+        [KeyboardButton(f"{report_name}: Сегодня")],
+        [KeyboardButton(f"{report_name}: Вчера")],
+        [KeyboardButton(f"{report_name}: Неделя")],
+        [KeyboardButton(f"{report_name}: Текущий месяц")],
+        [KeyboardButton(f"{report_name}: Прошлый месяц")],
+        [KeyboardButton("Главное меню")],
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+    await update.message.reply_text(
+        f"Выберите период для отчета \"*{escape_markdown(report_name, version=2)}*\":",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.MARKDOWN_V2,
+    )
+    context.user_data['state'] = REPORT_MENU
+
+async def handle_button_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_message = update.message.text
+    if context.user_data.get('state') == MAIN_MENU:
+        if user_message == "Сводный отчет по выручке":
+            await send_period_selection_keyboard(update, context, "Сводный отчет по выручке")
+        elif user_message == "Выручка по типам оплат":
+            await send_period_selection_keyboard(update, context, "Выручка по типам оплат")
+        elif report_type == "Отмены и удаления блюд":
+            await send_period_selection_keyboard(update, context, "Отмены и удаления блюд")
+        elif user_message == "Выручка по категориям блюд":
+            await send_period_selection_keyboard(update, context, "Выручка по категориям блюд")
+        elif user_message == "Топ блюд по выручке":
+            await send_period_selection_keyboard(update, context, "Топ блюд по выручке")
+        elif user_message == "Средний чек":
+            await send_period_selection_keyboard(update, context, "Средний чек")
+        elif user_message == "Скидки и Надбавки":
+            await send_period_selection_keyboard(update, context, "Скидки и Надбавки")
+        elif user_message == "Выручка по официантам":
+            await send_period_selection_keyboard(update, context, "Выручка по официантам")
+        elif user_message == "Выручка по типам заказов":
+            await send_period_selection_keyboard(update, context, "Выручка по типам заказов")
+        elif user_message == "Остатки по складам":
+            await show_store_balances_report(update, context)
+            await send_main_menu_keyboard(update, context)
+            context.user_data['state'] = MAIN_MENU
+        elif user_message == "/start":
+            await start(update, context)
+        elif user_message == "Главное меню":
+            await send_main_menu_keyboard(update, context)
+            context.user_data['state'] = MAIN_MENU
+        else:
+            await send_main_menu_keyboard(update, context)
+    elif context.user_data.get('state') == REPORT_MENU:
+
+        report_type = context.user_data.get('current_report_type')
+        period_names = ["Сегодня", "Вчера", "Неделя", "Текущий месяц", "Прошлый месяц"]
+        selected_period = None
+        for period_name in period_names:
+            if period_name in user_message:
+                selected_period = period_name
+                break
+        if user_message == "Главное меню":
+            await send_main_menu_keyboard(update, context)
+            context.user_data['state'] = MAIN_MENU
+            return
+        if not selected_period:
+            await update.message.reply_text(
+                "Пожалуйста, выберите корректный период из меню\\. "
+                "Или нажмите 'Главное меню' для возврата\\.",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
+            await send_period_selection_keyboard(update, context, report_type)
+            return
+        start_date, end_date = get_period_dates(selected_period)
+        if report_type == "Сводный отчет по выручке":
+            await show_summary_revenue_report(update, context, start_date, end_date)
+        elif report_type == "Средний чек":
+            await show_average_check_report(update, context, start_date, end_date)
+        elif report_type == "Отмены и удаления блюд":
+            await show_order_cancellations_report(update, context, start_date, end_date)
+        elif report_type == "Топ блюд по выручке":
+            await show_top_dishes_report(update, context, start_date, end_date, 10)
+        elif report_type == "Скидки и Надбавки":
+            await show_discounts_report(update, context, start_date, end_date)
+        elif report_type == "Выручка по типам оплат":
+            await show_pay_types_revenue_report(update, context, start_date, end_date)
+        elif report_type == "Выручка по категориям блюд":
+            await show_dish_category_revenue_report(update, context, start_date, end_date)
+        elif report_type == "Выручка по официантам":
+            await show_waiter_revenue_report(update, context, start_date, end_date)
+        elif report_type == "Выручка по типам заказов":
+            await show_order_type_revenue_report(update, context, start_date, end_date)
+        await send_main_menu_keyboard(update, context)
+        context.user_data['state'] = MAIN_MENU
+    else:
+        await handle_message(update, context)
+
+def main() -> None:
+    application = Application.builder().token("7674773820:AAF8lJD-okqbzkvbdUDbf_2mnrrognsroU0").build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_button_text))
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
